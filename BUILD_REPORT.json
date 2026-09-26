@@ -1,0 +1,20 @@
+{
+  "app": "Kapadokya Personel",
+  "version": "1.0.0",
+  "package": "com.kapadokyaonline.personel",
+  "minSdk": 26,
+  "targetSdk": 35,
+  "startUrl": "https://personel.kapadokyaonline.com/employee_portal.php",
+  "qrFlow": "KIOSK_DISPLAYS_QR__ANDROID_EMPLOYEE_CAMERA_SCANS",
+  "checks": {
+    "camera_permission": true,
+    "https_only": true,
+    "camera_only_allowed_origin": true,
+    "ssl_errors_cancelled": true,
+    "webview_debug_off": true,
+    "third_party_cookies_off": true,
+    "qr_flow_uses_employee_portal": true
+  },
+  "apkCompiledInThisEnvironment": false,
+  "reason": "Android SDK/Gradle toolchain is not installed in this execution environment."
+}
