@@ -34,19 +34,23 @@ public class MainActivity extends Activity {
     private static final String START_URL = "https://personel.kapadokyaonline.com/employee_portal.php";
     private static final int REQ_CAMERA = 7001;
     private static final int REQ_FILE = 7002;
-    private static final int MAX_MAIN_FRAME_RETRIES = 4;
+    private static final int MAX_NETWORK_RETRIES = 4;
 
     private WebView webView;
     private ProgressBar progressBar;
     private PermissionRequest pendingCameraRequest;
     private ValueCallback<Uri[]> pendingFileCallback;
 
-    private final Handler handler = new Handler(Looper.getMainLooper());
-    private int mainFrameRetryCount = 0;
-    private boolean mainFrameFailed = false;
-    private String lastMainUrl = START_URL;
+    private final Handler retryHandler = new Handler(Looper.getMainLooper());
+    private int networkRetryCount = 0;
+    private boolean retryScheduled = false;
+    private boolean lastLoadHadNetworkError = false;
+    private boolean currentMainFrameError = false;
+    private String lastMainFrameUrl = START_URL;
+
     private ConnectivityManager connectivityManager;
     private ConnectivityManager.NetworkCallback networkCallback;
+    private boolean networkCallbackRegistered = false;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -74,7 +78,7 @@ public class MainActivity extends Activity {
         s.setMediaPlaybackRequiresUserGesture(true);
         s.setCacheMode(WebSettings.LOAD_DEFAULT);
         s.setLoadsImagesAutomatically(true);
-        s.setDefaultTextEncodingName("UTF-8");
+        s.setBlockNetworkLoads(false);
         s.setUserAgentString(s.getUserAgentString() + " KapadokyaPersonelAndroid/1.0.3");
 
         webView.setWebViewClient(new SafeClient());
@@ -84,10 +88,6 @@ public class MainActivity extends Activity {
 
         if (savedInstanceState != null) {
             webView.restoreState(savedInstanceState);
-            String restored = webView.getUrl();
-            if (restored != null && isAllowed(Uri.parse(restored))) {
-                lastMainUrl = restored;
-            }
         } else {
             webView.loadUrl(START_URL);
         }
@@ -99,6 +99,14 @@ public class MainActivity extends Activity {
                 && ALLOWED_HOST.equalsIgnoreCase(uri.getHost());
     }
 
+    private boolean isAllowedUrl(String url) {
+        try {
+            return isAllowed(Uri.parse(url));
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
     private void openExternal(Uri uri) {
         try {
             startActivity(new Intent(Intent.ACTION_VIEW, uri));
@@ -107,24 +115,76 @@ public class MainActivity extends Activity {
         }
     }
 
-    private boolean isNetworkAvailable() {
+    private boolean hasUsableNetwork() {
         try {
             if (connectivityManager == null) {
                 connectivityManager =
                         (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
             }
-            if (connectivityManager == null) return true;
 
             Network network = connectivityManager.getActiveNetwork();
             if (network == null) return false;
 
-            NetworkCapabilities caps = connectivityManager.getNetworkCapabilities(network);
+            NetworkCapabilities caps =
+                    connectivityManager.getNetworkCapabilities(network);
+
             return caps != null
                     && caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET);
         } catch (Exception e) {
-            // Ağ durumunu okuyamazsak gereksiz yere sayfayı engellemeyelim.
             return true;
         }
+    }
+
+    private boolean isTransientNetworkError(int code) {
+        return code == WebViewClient.ERROR_UNKNOWN
+                || code == WebViewClient.ERROR_HOST_LOOKUP
+                || code == WebViewClient.ERROR_CONNECT
+                || code == WebViewClient.ERROR_IO
+                || code == WebViewClient.ERROR_TIMEOUT;
+    }
+
+    private long retryDelayForAttempt(int attempt) {
+        switch (attempt) {
+            case 1: return 700L;
+            case 2: return 1600L;
+            case 3: return 3200L;
+            default: return 5500L;
+        }
+    }
+
+    private void scheduleNetworkRetry(String url) {
+        if (webView == null || retryScheduled) return;
+        if (!isAllowedUrl(url)) url = START_URL;
+
+        if (networkRetryCount >= MAX_NETWORK_RETRIES) {
+            Toast.makeText(
+                    this,
+                    "Bağlantı kurulamadı. İnterneti kontrol edip sayfayı tekrar deneyin.",
+                    Toast.LENGTH_LONG
+            ).show();
+            return;
+        }
+
+        if (!hasUsableNetwork()) {
+            // Ağ geri geldiğinde NetworkCallback tekrar çağıracak.
+            return;
+        }
+
+        final String retryUrl = url;
+        final int attempt = ++networkRetryCount;
+        final long delay = retryDelayForAttempt(attempt);
+
+        retryScheduled = true;
+
+        retryHandler.postDelayed(() -> {
+            retryScheduled = false;
+
+            if (webView == null || !hasUsableNetwork()) return;
+
+            CookieManager.getInstance().flush();
+            webView.stopLoading();
+            webView.loadUrl(retryUrl);
+        }, delay);
     }
 
     private void registerNetworkRecovery() {
@@ -132,145 +192,43 @@ public class MainActivity extends Activity {
             connectivityManager =
                     (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
 
-            if (connectivityManager == null) return;
-
             networkCallback = new ConnectivityManager.NetworkCallback() {
                 @Override
                 public void onAvailable(Network network) {
-                    handler.postDelayed(() -> {
-                        if (mainFrameFailed && webView != null) {
-                            mainFrameRetryCount = 0;
-                            retryMainFrameNow();
+                    runOnUiThread(() -> {
+                        if (lastLoadHadNetworkError && webView != null) {
+                            networkRetryCount = 0;
+                            scheduleNetworkRetry(lastMainFrameUrl);
                         }
-                    }, 700);
+                    });
                 }
             };
 
             connectivityManager.registerDefaultNetworkCallback(networkCallback);
+            networkCallbackRegistered = true;
         } catch (Exception ignored) {
-            networkCallback = null;
+            networkCallbackRegistered = false;
         }
-    }
-
-    private void retryMainFrameNow() {
-        if (webView == null) return;
-
-        String target = lastMainUrl;
-        if (target == null || !isAllowed(Uri.parse(target))) {
-            target = START_URL;
-        }
-
-        final String retryUrl = target;
-        handler.post(() -> {
-            if (webView != null) {
-                webView.stopLoading();
-                webView.loadUrl(retryUrl);
-            }
-        });
-    }
-
-    private void scheduleMainFrameRetry(String failedUrl) {
-        if (failedUrl != null && isAllowed(Uri.parse(failedUrl))) {
-            lastMainUrl = failedUrl;
-        }
-
-        mainFrameFailed = true;
-
-        if (!isNetworkAvailable()) {
-            showRecoverableErrorPage(
-                    "İnternet bağlantısı bekleniyor",
-                    "Telefon yeniden internete bağlandığında uygulama otomatik olarak tekrar deneyecek."
-            );
-            return;
-        }
-
-        if (mainFrameRetryCount < MAX_MAIN_FRAME_RETRIES) {
-            mainFrameRetryCount++;
-            long delay = 700L * mainFrameRetryCount;
-
-            handler.postDelayed(() -> {
-                if (mainFrameFailed && webView != null) {
-                    retryMainFrameNow();
-                }
-            }, delay);
-            return;
-        }
-
-        showRecoverableErrorPage(
-                "Bağlantı geçici olarak kesildi",
-                "Sunucu tarayıcıdan açılıyor olsa bile Android WebView bağlantıyı zaman zaman yarıda kesebiliyor. Tekrar Dene düğmesine basın."
-        );
-    }
-
-    private void showRecoverableErrorPage(String title, String detail) {
-        if (webView == null) return;
-
-        String html = "<!doctype html><html><head>"
-                + "<meta charset='utf-8'>"
-                + "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-                + "<style>"
-                + "body{font-family:Arial,sans-serif;background:#f6f7f9;color:#111;margin:0;padding:28px;}"
-                + ".box{max-width:520px;margin:70px auto;background:#fff;border-radius:18px;padding:24px;"
-                + "box-shadow:0 10px 35px rgba(0,0,0,.08);}"
-                + "h2{margin-top:0}p{line-height:1.55;color:#555}"
-                + "a{display:inline-block;background:#d90000;color:#fff;text-decoration:none;"
-                + "padding:13px 18px;border-radius:10px;font-weight:700}"
-                + "</style></head><body><div class='box'>"
-                + "<h2>" + escapeHtml(title) + "</h2>"
-                + "<p>" + escapeHtml(detail) + "</p>"
-                + "<a href='" + START_URL + "'>Tekrar Dene</a>"
-                + "</div></body></html>";
-
-        webView.loadDataWithBaseURL(
-                "https://" + ALLOWED_HOST + "/",
-                html,
-                "text/html",
-                "UTF-8",
-                null
-        );
-    }
-
-    private String escapeHtml(String s) {
-        if (s == null) return "";
-        return s.replace("&", "&amp;")
-                .replace("<", "&lt;")
-                .replace(">", "&gt;")
-                .replace(""", "&quot;")
-                .replace("'", "&#39;");
     }
 
     private class SafeClient extends WebViewClient {
         @Override
         public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
             Uri uri = request.getUrl();
-            if (isAllowed(uri)) {
-                if (request.isForMainFrame()) {
-                    lastMainUrl = uri.toString();
-                }
-                return false;
-            }
+            if (isAllowed(uri)) return false;
             openExternal(uri);
             return true;
         }
 
         @Override
         public void onPageStarted(WebView view, String url, android.graphics.Bitmap favicon) {
-            if (url != null && isAllowed(Uri.parse(url))) {
-                lastMainUrl = url;
-            }
-        }
+            super.onPageStarted(view, url, favicon);
 
-        @Override
-        public void onPageFinished(WebView view, String url) {
-            CookieManager.getInstance().flush();
-
-            if (url != null
-                    && isAllowed(Uri.parse(url))
-                    && !url.startsWith("data:")) {
-                mainFrameFailed = false;
-                mainFrameRetryCount = 0;
-                lastMainUrl = url;
+            if (isAllowedUrl(url)) {
+                lastMainFrameUrl = url;
             }
+
+            currentMainFrameError = false;
         }
 
         @Override
@@ -279,25 +237,48 @@ public class MainActivity extends Activity {
                 WebResourceRequest request,
                 WebResourceError error
         ) {
+            super.onReceivedError(view, request, error);
+
             if (request == null || !request.isForMainFrame()) return;
 
-            Uri uri = request.getUrl();
-            if (!isAllowed(uri)) return;
+            currentMainFrameError = true;
+            lastLoadHadNetworkError = true;
 
-            // SSL hataları burada otomatik tekrar denenmez; güvenlik kontrolü ayrı tutulur.
-            int code = error != null ? error.getErrorCode() : ERROR_UNKNOWN;
-            if (code == ERROR_FAILED_SSL_HANDSHAKE) return;
+            String failedUrl =
+                    request.getUrl() != null
+                            ? request.getUrl().toString()
+                            : lastMainFrameUrl;
 
-            scheduleMainFrameRetry(uri.toString());
+            if (isAllowedUrl(failedUrl)) {
+                lastMainFrameUrl = failedUrl;
+            }
+
+            int code = error != null
+                    ? error.getErrorCode()
+                    : WebViewClient.ERROR_UNKNOWN;
+
+            if (isTransientNetworkError(code)) {
+                scheduleNetworkRetry(lastMainFrameUrl);
+            }
         }
 
         @Override
-        public void onReceivedSslError(
-                WebView view,
-                SslErrorHandler handler,
-                SslError error
-        ) {
-            mainFrameFailed = false;
+        public void onPageFinished(WebView view, String url) {
+            CookieManager.getInstance().flush();
+
+            if (!currentMainFrameError && isAllowedUrl(url)) {
+                lastLoadHadNetworkError = false;
+                networkRetryCount = 0;
+                retryScheduled = false;
+                lastMainFrameUrl = url;
+            }
+
+            super.onPageFinished(view, url);
+        }
+
+        @Override
+        public void onReceivedSslError(WebView view, SslErrorHandler handler, SslError error) {
+            // SSL hatalarını ASLA bypass etmiyoruz.
             handler.cancel();
             Toast.makeText(
                     MainActivity.this,
@@ -334,6 +315,7 @@ public class MainActivity extends Activity {
             if (pendingFileCallback != null) {
                 pendingFileCallback.onReceiveValue(null);
             }
+
             pendingFileCallback = filePathCallback;
 
             Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
@@ -357,6 +339,7 @@ public class MainActivity extends Activity {
         }
 
         boolean wantsCamera = false;
+
         for (String res : request.getResources()) {
             if (PermissionRequest.RESOURCE_VIDEO_CAPTURE.equals(res)) {
                 wantsCamera = true;
@@ -440,43 +423,52 @@ public class MainActivity extends Activity {
     @Override
     protected void onPause() {
         CookieManager.getInstance().flush();
-        if (webView != null) webView.onPause();
+
+        if (webView != null) {
+            webView.onPause();
+        }
+
         super.onPause();
     }
 
     @Override
     protected void onResume() {
         super.onResume();
+
         if (webView != null) {
             webView.onResume();
 
-            if (mainFrameFailed && isNetworkAvailable()) {
-                handler.postDelayed(this::retryMainFrameNow, 500);
+            if (lastLoadHadNetworkError) {
+                networkRetryCount = 0;
+                scheduleNetworkRetry(lastMainFrameUrl);
             }
         }
     }
 
     @Override
     protected void onSaveInstanceState(Bundle outState) {
-        if (webView != null) webView.saveState(outState);
+        if (webView != null) {
+            webView.saveState(outState);
+        }
+
         super.onSaveInstanceState(outState);
     }
 
     @Override
     protected void onDestroy() {
-        try {
-            if (connectivityManager != null && networkCallback != null) {
-                connectivityManager.unregisterNetworkCallback(networkCallback);
-            }
-        } catch (Exception ignored) {
-        }
+        retryHandler.removeCallbacksAndMessages(null);
 
-        handler.removeCallbacksAndMessages(null);
+        if (networkCallbackRegistered
+                && connectivityManager != null
+                && networkCallback != null) {
+            try {
+                connectivityManager.unregisterNetworkCallback(networkCallback);
+            } catch (Exception ignored) {
+            }
+        }
 
         if (webView != null) {
             webView.stopLoading();
-            webView.setWebChromeClient(null);
-            webView.setWebViewClient(null);
             webView.destroy();
             webView = null;
         }
